@@ -1,148 +1,177 @@
 # Mini-Redis：C++17 内存键值存储
 
-[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)](https://isocpp.org/std/the-standard)
-[![Linux](https://img.shields.io/badge/Platform-Linux-important)](#构建)
-[![CMake](https://img.shields.io/badge/CMake-3.15%2B-brightgreen)](https://cmake.org/)
-[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
-
-一个兼容 RESP 协议的内存键值数据库，用 C++17 与 Linux epoll 从零实现。
-支持 String / Hash / ZSet 三种数据类型、键过期、AOF 与 RDB 两种持久化，以及主从复制，
-可以直接用 `redis-cli` 连接操作。
+用 C++17 与 Linux epoll 从零实现的内存键值数据库，兼容 RESP 协议。
+支持 String / Hash / ZSet 三种数据结构、键过期、AOF 与 RDB 两种持久化、以及主从复制，
+可以直接用 `redis-cli` 连接操作（无第三方依赖，只用标准库与 POSIX 接口）。
 
 ## 特性
 
-- **网络层**：单线程 Reactor，`epoll` 边缘触发（`EPOLLET`），手写 RESP 协议解析状态机，
-  支持流式解析与粘包/半包。
-- **存储**：`unordered_map` 哈希索引 + 统一过期索引；ZSet 在小集合时用有序 `vector`，
-  成员数超过 128 时自动切换为跳表。
-- **过期**：惰性删除（访问时判断）+ 主动扫描（`timerfd` 每 200ms 触发，每次采样 64 个键）。
-- **持久化**：AOF（`no` / `everysec` / `always` 三种刷盘策略，支持 `BGREWRITEAOF` 重写）
-  与 RDB 快照（`MRDB2` 文本格式）。
-- **复制**：`SYNC` 全量同步与 `PSYNC` 增量续传，基于 4MB 复制积压缓冲区（backlog）。
-- **零第三方依赖**：只用 C++17 标准库与 POSIX 接口。
+- **单线程 Reactor**：`epoll` 边缘触发（`EPOLLET`），一个事件循环处理所有连接；
+  超时驱动的过期扫描用 `timerfd` 挂进同一个循环，不额外开线程。
+- **手写 RESP 协议解析**：状态机逐字节解析，支持粘包与半包（一次 read 里有多条命令、或半条命令），
+  入站/出站缓冲都是动态字节数组。
+- **三种数据结构**：String、Hash、ZSet。ZSet 在小集合时用有序 `vector`，
+  成员数超过 128 时自动切换为跳表，兼顾小集合的缓存友好与大集合的插入性能。
+- **键过期**：惰性删除（访问时判断）+ 主动扫描（每 200ms 触发，每次采样 64 个键）。
+- **AOF 持久化**：`no` / `everysec` / `always` 三种刷盘策略，批量聚合、预分配、
+  `writev` 合并写、`sync_file_range` 后台回写、`BGREWRITEAOF` 重写。
+- **RDB 快照**：`MRDB2` 文本格式，`SAVE` / `BGSAVE` 落盘，启动时自动加载。
+- **主从复制**：`SYNC` 全量同步，`PSYNC` 基于 4MB 复制积压缓冲区（backlog）增量续传。
+
+## 架构
+
+```
+        ┌─────────────────────────────────────────────────────┐
+        │  主线程：epoll_wait (EPOLLET)                        │
+        │    ├─ listen_fd ─► accept ─► 每连接读缓冲             │
+        │    ├─ conn_fd   ─► RESP 解析 ─► 命令分发 ─► 响应入缓冲  │
+        │    └─ timer_fd  ─► 每 200ms 主动过期扫描（64 键/次）    │
+        └───────────────┬─────────────────────────────────────┘
+                        │ 写命令
+        ┌───────────────▼──────────────┐   ┌──────────────────┐
+        │   KeyValueStore              │   │  AOF writer 线程  │
+        │   map<string, Record>        │──►│  批量 writev      │
+        │   expire_index_              │   │  everysec/always │
+        │   String / Hash / ZSet(跳表)  │   ├──────────────────┤
+        └───────────────┬──────────────┘   │ AOF rewriter 线程 │
+                        │                  └──────────────────┘
+                        ├─► RDB 快照（MRDB2 文本，SAVE / BGSAVE）
+                        └─► backlog（4MB）─► 从库（SYNC / PSYNC）
 ```
 
 ## 支持的命令
 
-| 类型     | 命令                                              |
-|:------ |:----------------------------------------------- |
-| 连接     | `PING`、`ECHO`                                   |
-| String | `SET`、`GET`、`DEL`、`EXISTS`、`KEYS`、`FLUSHALL`    |
-| 过期     | `EXPIRE`、`TTL`                                  |
-| Hash   | `HSET`、`HGET`、`HDEL`、`HEXISTS`、`HGETALL`、`HLEN` |
-| ZSet   | `ZADD`、`ZREM`、`ZRANGE`、`ZSCORE`                 |
-| 持久化    | `SAVE`、`BGSAVE`、`BGREWRITEAOF`                  |
-| 运维     | `INFO`、`CONFIG GET`                             |
-| 复制     | `SYNC`、`PSYNC`                                  |
+| 分组 | 命令 |
+| :--- | :--- |
+| 连接 | `PING`、`ECHO` |
+| String / 通用 | `SET`、`GET`、`DEL`、`EXISTS`、`KEYS`、`FLUSHALL` |
+| 过期 | `EXPIRE`、`TTL` |
+| Hash | `HSET`、`HGET`、`HDEL`、`HEXISTS`、`HGETALL`、`HLEN` |
+| ZSet | `ZADD`、`ZREM`、`ZRANGE`、`ZSCORE` |
+| 持久化 | `SAVE`、`BGSAVE`、`BGREWRITEAOF` |
+| 运维 | `INFO`、`CONFIG GET` |
+| 复制 | `SYNC`、`PSYNC` |
 
-## 持久化
-
-### AOF
-
-写命令先追加到 AOF。三种模式由 `aof.mode` 控制：
-
-| 模式         | 行为                           |
-|:---------- |:---------------------------- |
-| `no`       | 只写用户态缓冲，由内核决定何时落盘            |
-| `everysec` | 每秒一次 `fdatasync`，兼顾性能与安全（默认） |
-| `always`   | 每条命令都 `fdatasync`，最安全但最慢     |
-
-实现上的几个要点：
-
-- **批量聚合**：攒够 `aof.batch_bytes`（默认 256KB）或等待超过 `aof.batch_wait_us`
-  才真正调用 `writev`，把大量小写入合并成一次系统调用。
-- **预分配**：按 `aof.prealloc_bytes`（默认 64MB）预扩展文件，减少文件尺寸反复增长。
-- **部分写处理**：`writev` 返回值小于待写长度时，从偏移处继续写。
-- **`sync_file_range`**：`aof.use_sync_file_range` 打开后，写入完成即触发后台回写，
-  达到 `aof.sfr_min_bytes` 才调用，避免过于频繁。
-- **`BGREWRITEAOF`**：后台线程重写 AOF，重写期间的新命令继续写旧文件并增量缓存，
-  重写结束后切到新文件，避免阻塞主线程。
-
-### RDB
-
-`SAVE` / `BGSAVE` 把全量数据写成 `MRDB2` 格式的快照文件。格式为文本：
-`STR` / `HASH` / `ZSET` 三段，每段先写数量，再逐行写记录，加载时按段解析。
-进程启动时若存在 `dump.rdb` 会自动加载。
-
-## 主从复制
-
-- `SYNC`：从库连上后获得全量 RDB 快照，之后接收增量命令流。
-- `PSYNC`：从库断线重连时带上自己的 offset，如果该 offset 仍落在主库的 4MB backlog 内，
-  只补发缺失部分，否则退化为全量同步。
+共 27 条。未实现的命令返回错误串，不会因此断开连接。
 
 ## 目录结构
 
 ```
 .
-├── include/mini_redis/     # 头文件（server / kv / resp / aof / rdb / replica / config）
-├── src/                    # 实现
+├── include/mini_redis/       # 头文件
+│   ├── server.hpp            # 事件循环、连接管理、命令分发
+│   ├── kv.hpp                # KeyValueStore：String / Hash / ZSet 与过期索引
+│   ├── resp.hpp              # RESP 解析与响应编码
+│   ├── aof.hpp               # AOF 写入、重写、回放
+│   ├── rdb.hpp               # RDB 快照（MRDB2）
+│   ├── replica_client.hpp    # 从库向主库同步
+│   ├── config.hpp            # 配置结构体
+│   └── ...
+├── src/                      # 与上面一一对应的实现
 ├── tools/
-│   ├── test_smoke.sh       # 功能冒烟测试（依赖 redis-cli）
-│   └── bench.sh            # 压测脚本（依赖 redis-benchmark）
-├── always.conf             # 配置样例：always 刷盘
-├── everysec.conf           # 配置样例：everysec 刷盘
-├── none.conf               # 配置样例：不主动 fsync
-├── aof.conf                # 配置样例：AOF + always
-├── rdb.conf                # 配置样例：只用 RDB
+│   ├── test_smoke.sh         # 冒烟测试（需本机有 redis-cli）
+│   └── bench.sh              # 压测脚本（需 redis-benchmark）
+├── always.conf everysec.conf none.conf aof.conf rdb.conf   # 配置样例
 └── CMakeLists.txt
 ```
 
-## 前置条件
-
-- Linux 内核 ≥ 4.14（需要 `epoll`、`timerfd`、`sync_file_range`）
-- GCC ≥ 8 或 Clang ≥ 8（支持 C++17）
-- CMake ≥ 3.15、`make` 或 `ninja`
-
-> **Windows 用户**：请通过 [WSL2](https://learn.microsoft.com/windows/wsl/install) 构建，
-> 原生 Windows 不支持本项目依赖的 `epoll` / `timerfd` / `writev` 等 POSIX 接口。
-> 推荐发行版：Ubuntu 22.04+。
-
-## 构建
+## 构建与运行
 
 ```bash
 cmake -B build
-cmake --build build -j
+cmake --build build -j          # 产物 build/mini_redis
 ```
-
-产物为 `build/mini_redis`，也可以用 `cmake --install build` 安装到 `bin/`。
-
-## 运行
 
 ```bash
-./build/mini_redis                     # 默认 0.0.0.0:6379
-./build/mini_redis --port 7000          # 指定端口
-./build/mini_redis --bind 127.0.0.1     # 只监听本机
-./build/mini_redis --config aof.conf    # 读取配置文件
+./build/mini_redis                       # 默认 0.0.0.0:6379
+./build/mini_redis --port 7000            # 指定端口
+./build/mini_redis --bind 127.0.0.1       # 只监听本机
+./build/mini_redis --config aof.conf      # 读取配置文件
+./build/mini_redis --help
 ```
 
-配置文件是 `key=value` 形式，可用项：
+CMake 默认 `Release`（`-O3 -DNDEBUG`），并开启 `-Wall -Wextra -Wpedantic -Wconversion`。
 
-| 配置项                                                           | 说明                                       |
-|:------------------------------------------------------------- |:---------------------------------------- |
-| `port`、`bind_address`                                         | 监听端口与地址                                  |
-| `aof.enabled`、`aof.mode`                                      | 是否开启 AOF 及刷盘模式（`no`/`everysec`/`always`） |
-| `aof.dir`、`aof.filename`                                      | AOF 文件目录与文件名                             |
-| `aof.batch_bytes`、`aof.batch_wait_us`                         | 批量聚合的字节阈值与等待上限                           |
-| `aof.prealloc_bytes`                                          | AOF 预分配大小                                |
-| `aof.sync_interval_ms`                                        | `everysec` 模式的实际同步周期                     |
-| `aof.use_sync_file_range`、`aof.sfr_min_bytes`                 | 后台回写开关与触发阈值                              |
-| `aof.fadvise_dontneed_after_sync`                             | 同步后对已落盘范围做 `DONTNEED`                    |
-| `rdb.enabled`、`rdb.dir`、`rdb.filename`                        | RDB 开关与路径                                |
-| `replica.enabled`、`replica.master_host`、`replica.master_port` | 作为从库连接主库                                 |
+## 配置
 
-## 验证
+配置文件是 `key=value` 形式（`true` / `false`、`1` / `0`、`yes` 都可）。命令行参数优先级高于配置文件。
 
-```bash
-# 功能冒烟（需要一个运行中的实例，且本机有 redis-cli）
-./build/mini_redis --config aof.conf &
-bash tools/test_smoke.sh
+| 配置项 | 说明 | 样例值 |
+| :--- | :--- | :--- |
+| `port` | 监听端口 | `6379` |
+| `bind_address` | 监听地址 | `0.0.0.0` |
+| `aof.enabled` | 是否开启 AOF | `true` |
+| `aof.mode` | 刷盘策略：`no` / `everysec` / `always` | `everysec` |
+| `aof.dir`、`aof.filename` | AOF 文件位置 | `./data`、`appendonly.aof` |
+| `aof.batch_bytes` | 攒够多少字节就落一次 `writev` | `262144` |
+| `aof.batch_wait_us` | 攒不够字节时的最长等待（微秒） | `2000` |
+| `aof.prealloc_bytes` | 预分配大小（见「已知问题」第 1 条） | `67108864` |
+| `aof.sync_interval_ms` | `everysec` 模式的实际同步周期 | `250` |
+| `aof.use_sync_file_range`、`aof.sfr_min_bytes` | 后台回写开关与触发阈值 | `true`、`1048576` |
+| `aof.fadvise_dontneed_after_sync` | 落盘后对已写范围做 `DONTNEED` | `false` |
+| `rdb.enabled`、`rdb.dir`、`rdb.filename` | RDB 开关与路径 | `true`、`./data`、`dump.rdb` |
+| `replica.enabled` | 作为从库启动 | `true` |
+| `replica.master_host`、`replica.master_port` | 主库地址 | `127.0.0.1`、`6379` |
 
-# 压测（需要 redis-benchmark）
-DUR=10 bash tools/bench.sh
+## 实测结果
 
-# 手动验证
-redis-cli -p 6379 set foo bar
-redis-cli -p 6379 get foo
-redis-cli -p 6379 zadd rank 100 alice
-redis-cli -p 6379 zrange rank 0 -1
-```
+环境：WSL2 Ubuntu / g++ 15.2 / `-O2`。
+
+### 功能
+
+| 项目 | 结果 |
+| :--- | :--- |
+| 编译（`-Wall -Wextra -Wpedantic -Wconversion`） | 0 警告、0 错误 |
+| `PING` / `SET` / `GET` / `EXISTS` / `TTL` / `DEL` | 返回值与 Redis 语义一致 |
+| `HSET` / `HGET`、`ZADD` / `ZSCORE` | 正常 |
+| `INFO` / `CONFIG GET` | 返回内容，`redis-cli` 可正常握手 |
+| RDB：`SAVE` → `kill -9` → 重启 | 数据与 TTL 均恢复（`dump.rdb` 93 B，格式 `MRDB2`） |
+| 主从：主库 `SET` / `HSET` → 从库读 | 从库能读到增量数据 |
+| AOF（`aof.prealloc_bytes=0`）：`SET` / `EXPIRE` 回放 | 通过 |
+| AOF（默认预分配）：`kill -9` 后回放 | **数据全部丢失，见「已知问题」第 1 条** |
+
+### 吞吐
+
+单客户端、管道化 1000 条/批、AOF 与 RDB 关闭（测的是事件循环本身）：
+
+| 场景 | 结果 |
+| :--- | :--- |
+| 管道化 `SET`（10 万条） | 19.6 万 QPS |
+| 管道化 `GET`（10 万条） | 26.4 万 QPS |
+| 串行 `GET`（一次一个往返） | 2.1 万 QPS，单条往返 47 µs |
+
+## 已知问题
+
+以下问题均为实测发现，按影响排序。写在这里而不是藏起来，是因为它们会改变「能靠它存数据」的预期。
+
+**1. 默认配置下 AOF 回放会得到空库（严重）**
+
+`aof.prealloc_bytes` 默认 64MB。启动时用 `posix_fallocate(fd, 0, 64MB)` 把文件撑大，
+而写入用的是 `O_APPEND`，于是所有命令都被写在 64MB 空洞**之后**；回放却从偏移 0 开始读，
+第一个字节是 `\0` 而不是 `*`，解析循环立即 `break`——一条命令都不会重放。
+
+- 复现：默认配置写入几条命令 → `kill -9` → 用同一份 AOF 重启 → 全部 key 消失。
+- 规避：`aof.prealloc_bytes=0`（数据从偏移 0 连续写入，回放正常）。
+
+**2. AOF 回放只覆盖 `SET` / `DEL` / `EXPIRE`**
+
+回放是「最小命令集」实现：`HSET` / `ZADD` 等写命令会写进 AOF 文件，但重启时不会被重放，
+Hash 与 ZSet 数据无法由此恢复。重要数据建议用 RDB 快照（已验证可完整恢复，含 TTL）。
+
+**3. 从库不拒写**
+
+从库收到写命令会照常执行，没有 Redis 的 `read-only` 保护，主从之间会出现不一致。
+
+**4. `ZSCORE` 返回浮点格式**
+
+返回 `10.000000`，而 Redis 返回整数化的 `10`；语义一致，`redis-cli` 能正常解析。
+
+**5. 单线程事件循环**
+
+命令处理全在主线程，多核只能靠多开实例分片；AOF 写入/重写与复制在后台线程，不阻塞主循环。
+
+## 说明
+
+- 仅支持 Linux（依赖 `epoll`、`timerfd`、`writev`、`sync_file_range`、`posix_fallocate`）。
+- `tools/test_smoke.sh` 与 `tools/bench.sh` 分别依赖本机安装 `redis-cli` 与 `redis-benchmark`。
+- `CONFIG GET`、`INFO` 只提供最小可用集，够 `redis-cli` 等工具正常握手。
