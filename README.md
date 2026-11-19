@@ -15,29 +15,6 @@
   与 RDB 快照（`MRDB2` 文本格式）。
 - **复制**：`SYNC` 全量同步与 `PSYNC` 增量续传，基于 4MB 复制积压缓冲区（backlog）。
 - **零第三方依赖**：只用 C++17 标准库与 POSIX 接口。
-
-## 架构
-
-```
-            ┌──────────────────────────────────────────────┐
-  redis-cli │  epoll_wait (EPOLLET)                        │
- ──────────►│    ├─ listen_fd  ──► accept ──► 每连接读缓冲   │
-            │    ├─ conn_fd    ──► RESP 解析 ──► 命令分发    │
-            │    └─ timer_fd   ──► 每 200ms 主动过期扫描     │
-            └───────────────────┬──────────────────────────┘
-                                │
-                    ┌───────────▼────────────┐
-                    │      KeyValueStore     │
-                    │  map<key, Record>      │
-                    │  expire_index_         │
-                    │  String / Hash / ZSet  │
-                    └───────────┬────────────┘
-                                │ 写命令先追加
-                    ┌───────────▼────────────┐
-                    │   AOF（批量聚合 + fsync）│
-                    │   RDB（MRDB2 快照）      │
-                    │   backlog（供 PSYNC）    │
-                    └────────────────────────┘
 ```
 
 ## 支持的命令
@@ -154,11 +131,3 @@ redis-cli -p 6379 get foo
 redis-cli -p 6379 zadd rank 100 alice
 redis-cli -p 6379 zrange rank 0 -1
 ```
-
-## 说明
-
-- 仅支持 Linux（依赖 `epoll`、`timerfd`、`writev`、`sync_file_range` 等接口）。
-- 命令处理是单线程的：所有回调都在事件循环线程里执行，持久化与 AOF 重写在后台线程完成。
-- `ZSCORE` 返回浮点格式（例如 `10.000000`），Redis 返回整数化的 `10`；语义一致，`redis-cli` 可正常解析。
-- 未实现的命令会返回错误串，`CONFIG GET`、`INFO` 只提供最小可用集，便于
-  `redis-cli` 等工具正常握手。
