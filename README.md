@@ -1,5 +1,10 @@
 # Mini-Redis：C++17 内存键值存储
 
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)](https://isocpp.org/std/the-standard)
+[![Linux](https://img.shields.io/badge/Platform-Linux-important)](#构建)
+[![CMake](https://img.shields.io/badge/CMake-3.15%2B-brightgreen)](https://cmake.org/)
+[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+
 一个兼容 RESP 协议的内存键值数据库，用 C++17 与 Linux epoll 从零实现。
 支持 String / Hash / ZSet 三种数据类型、键过期、AOF 与 RDB 两种持久化，以及主从复制，
 可以直接用 `redis-cli` 连接操作。
@@ -81,6 +86,16 @@
 ├── rdb.conf                # 配置样例：只用 RDB
 └── CMakeLists.txt
 ```
+
+## 前置条件
+
+- Linux 内核 ≥ 4.14（需要 `epoll`、`timerfd`、`sync_file_range`）
+- GCC ≥ 8 或 Clang ≥ 8（支持 C++17）
+- CMake ≥ 3.15、`make` 或 `ninja`
+
+> **Windows 用户**：请通过 [WSL2](https://learn.microsoft.com/windows/wsl/install) 构建，
+> 原生 Windows 不支持本项目依赖的 `epoll` / `timerfd` / `writev` 等 POSIX 接口。
+> 推荐发行版：Ubuntu 22.04+。
 
 ## 构建
 
